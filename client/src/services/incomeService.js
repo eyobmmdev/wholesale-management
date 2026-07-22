@@ -1,0 +1,22 @@
+import api from './api.js';
+
+export const incomeService = {
+  getIncome: async (params = {}) => {
+    return await api.get('/income/', { params });
+  },
+  createIncome: async (data) => {
+    return await api.post('/income/', data);
+  },
+  getIncomeById: async (id) => {
+    return await api.get(`/income/${id}/`);
+  },
+  getPaymentMethodOptions: async () => {
+    return await api.get('/payment-method-options/');
+  },
+  updateIncome: async (id, data) => {
+    return await api.put(`/income/${id}/`, data);
+  },
+  deleteIncome: async (id) => {
+    return await api.delete(`/income/${id}/`);
+  }
+};

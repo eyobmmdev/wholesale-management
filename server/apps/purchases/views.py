@@ -1,0 +1,189 @@
+from django.urls import reverse
+
+from django_filters.rest_framework.backends import DjangoFilterBackend
+from rest_framework import viewsets, status,filters
+from rest_framework.response import Response
+from rest_framework.exceptions import ValidationError
+from rest_framework.decorators import action
+from django.http import HttpResponse
+
+from .models import Purchase, PurchaseItem
+from .serializers import (
+    PurchaseSerializer,
+    PurchaseCreateSerializer,
+    PurchaseUpdateSerializer,
+    PurchaseItemSerializer,
+    PurchaseItemReadSerializer, AddItemToPurchaseSerializer,
+)
+
+from .filters import PurchaseFilter, PurchaseItemFilter
+from ..core.pagination import StandardPagination
+from invoice.purchases.generator import generate_purchase_invoice, InvoiceGenerationError
+from invoice.utils.public_documents import make_public_token
+
+class PurchaseViewSet(viewsets.ModelViewSet):
+    queryset = Purchase.objects.all()
+    pagination_class = StandardPagination
+    filterset_class = PurchaseFilter
+    filter_backends = [
+        DjangoFilterBackend,
+        filters.SearchFilter,
+        filters.OrderingFilter
+    ]
+    search_fields = ['shipping_code', 'notes']
+    ordering_fields = [
+        'date', 'total_purchase_amount', 'amount_paid_now',
+        'unpaid_amount', 'created_at',
+    ]
+    ordering = ['-date', '-created_at']
+
+    def get_serializer_class(self):
+        """Return appropriate serializer based on action."""
+        if self.action == 'create':
+            return PurchaseCreateSerializer
+        if self.action in ('update', 'partial_update'):
+            return PurchaseUpdateSerializer
+        # list and retrieve
+        return PurchaseSerializer
+
+    def get_queryset(self):
+        """Optimize queries with select_related and prefetch_related."""
+        qs = super().get_queryset()
+        qs = qs.select_related('factory')
+        if self.action in ('list', 'retrieve'):
+            qs = qs.prefetch_related('items', 'items__stock_batch')
+        return qs
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+
+        if not instance.is_deletable:
+            raise ValidationError(
+                "Cannot delete this purchase. Some items have already been sold. "
+                "Delete the sales first, then you can delete this purchase."
+            )
+
+        instance.delete()
+        return Response(
+            {"detail": f"Purchase {instance.shipping_code} deleted successfully."},
+            status=status.HTTP_204_NO_CONTENT
+        )
+
+    @action(detail=True, methods=['get'])
+    def invoice(self, request, pk=None):
+        purchase = self.get_object()
+        disposition = "attachment" if request.query_params.get("download") else "inline"
+
+        try:
+            pdf_bytes = generate_purchase_invoice(purchase)
+        except InvoiceGenerationError as exc:
+            # logger.error("Invoice generation failed for purchase %s: %s", pk, exc)
+            return Response(
+                {"detail": "Could not generate invoice. Please try again later."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        filename = f"invoice_{purchase.shipping_code}.pdf"
+        response = HttpResponse(pdf_bytes, content_type="application/pdf")
+        response["Content-Disposition"] = f'{disposition}; filename="{filename}"'
+        response["Content-Length"] = len(pdf_bytes)
+        response["Cache-Control"] = "private, max-age=3600"
+        return response
+
+    @action(detail=True, methods=['get'], url_path='invoice/share-link')
+    def invoice_share_link(self, request, pk=None):
+        purchase = self.get_object()
+        token = make_public_token("purchase-invoice", purchase.pk)
+        share_url = request.build_absolute_uri(
+            reverse('public-document', kwargs={'token': token})
+        )
+        return Response({"share_url": share_url})
+
+class PurchaseItemViewSet(viewsets.ModelViewSet):
+    """
+    Standalone CRUD for individual purchase items.
+
+    Useful for:
+        → Editing a single item line without resubmitting the whole purchase
+        → Adding new items to an existing purchase
+        → Viewing items across all purchases
+
+    LIST   /purchase-items/          → PurchaseItemReadSerializer
+    GET    /purchase-items/{id}/     → PurchaseItemReadSerializer
+    POST   /purchase-items/          → PurchaseItemSerializer (add item to purchase)
+    PUT    /purchase-items/{id}/     → PurchaseItemSerializer
+    PATCH  /purchase-items/{id}/     → PurchaseItemSerializer
+    DELETE /purchase-items/{id}/     → Only if no stock sold from this item
+
+    FILTERING:
+        ?purchase=5
+        ?item_code=SOCK
+        ?factory=2
+        ?shipping_code=SHP-A3
+        ?price_type=per_piece
+        ?date_from=2024-01-01
+
+    SEARCHING:
+        ?search=SOCK  (searches item_code and product_name)
+
+    ORDERING:
+        ?ordering=item_code
+        ?ordering=-total_item_amount
+        ?ordering=-created_at
+    """
+    queryset = PurchaseItem.objects.all()
+    pagination_class = StandardPagination
+    filterset_class = PurchaseItemFilter
+    filter_backends = [
+        DjangoFilterBackend,
+        filters.SearchFilter,
+        filters.OrderingFilter
+    ]
+    search_fields = ['item_code', 'product_name']
+    ordering_fields = ['item_code', 'total_item_amount', 'purchase_price', 'created_at']
+    ordering = ['item_code']
+
+    def get_serializer_class(self):
+        if self.action in ('list', 'retrieve'):
+            return PurchaseItemReadSerializer
+        elif self.action == 'create':
+            return AddItemToPurchaseSerializer
+        # update, partial_update
+        return PurchaseItemSerializer
+
+    def get_queryset(self):
+        """Optimize queries."""
+        qs = super().get_queryset()
+        qs = qs.select_related('purchase', 'purchase__factory')
+        if self.action in ('list', 'retrieve'):
+            qs = qs.select_related('stock_batch')
+        return qs
+
+    def destroy(self, request, *args, **kwargs):
+        """
+        Delete a purchase item only if no stock from it has been sold.
+
+        The database PROTECT constraint on StockBatch→SaleItem
+        would also block this, but we give a nicer error message.
+        """
+        instance = self.get_object()
+
+        # Check if any stock from this item has been sold
+        if hasattr(instance, 'stock_batch') and instance.stock_batch.sold_bags > 0:
+            raise ValidationError(
+                f"Cannot delete this item. {instance.stock_batch.sold_bags} bags "
+                f"have already been sold from this batch. "
+                f"Delete the sales first."
+            )
+
+        # Deleting the item will CASCADE delete the StockBatch
+        # and recalculate parent purchase totals via the model's save
+        purchase = instance.purchase
+        instance.delete()
+        purchase.recalculate_totals()
+        purchase.save()
+
+        return Response(
+            {"detail": "Purchase item deleted successfully."},
+            status=status.HTTP_204_NO_CONTENT
+        )
