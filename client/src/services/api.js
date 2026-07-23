@@ -2,7 +2,7 @@ import axios from 'axios';
 
 // Create an Axios instance with default configuration
 const api = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api', // Update this based on your Django setup
+  baseURL: `${import.meta.env.VITE_API_URL || "http://localhost:8000"}/api`,
   timeout: 10000,
   headers: {
     'Content-Type': 'application/json',
