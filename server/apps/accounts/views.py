@@ -28,6 +28,13 @@ class RegisterViewSet(viewsets.ViewSet):
     authentication_classes = []
 
     def create(self, request):
+
+        return Response({
+            "success": False,
+            "message": "Account creation not available at the moment. Please login with your existing account.",
+        }, status=403)
+
+    
         serializer = RegisterSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
