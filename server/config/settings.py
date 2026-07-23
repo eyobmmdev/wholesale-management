@@ -183,3 +183,4 @@ EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 
 # CORS_ALLOWED_ORIGINS = [*]
 CORS_ALLOW_ALL_ORIGINS = True
+
